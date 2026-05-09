@@ -9,284 +9,203 @@ import hmac
 import hashlib
 import struct
 import logging
-from telebot import types
+import re
+from telebot import types, util
 from datetime import datetime
 from flask import Flask
 from threading import Thread
 
 # ================= CONFIGURATION =================
 TOKEN = "8783194900:AAH__MsqIgqwKn_-Pzg2NdxQsIJ1OjvAVY8"
-ADMIN_ID = 8783194900 
-CHANNEL_LINK = "https://t.me/ws_vip_season_"
+ADMIN_ID = 8061525743  
 SUPPORT_USER = "@FB_SALL_AD"
+MIN_WITHDRAW = 100.0  # সর্বনিম্ন উইথড্র ১০০ টাকা
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 app = Flask('')
 
-# Logging setup for debugging
-logging.basicConfig(level=logging.INFO)
+# ================= DATABASE MANAGER =================
+class Database:
+    def __init__(self, db_name="master_data.db"):
+        self.db_name = db_name
+        self.init_db()
 
-# ================= DATABASE LAYER =================
-def init_db():
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    # Users table
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, 
-        username TEXT, 
-        balance REAL DEFAULT 0,
-        invites INTEGER DEFAULT 0,
-        referrer_id INTEGER,
-        last_task_time REAL DEFAULT 0,
-        lang TEXT DEFAULT 'BN'
-    )""")
-    # Task Reports table
-    cur.execute("""CREATE TABLE IF NOT EXISTS reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        task_type TEXT,
-        data TEXT,
-        status TEXT DEFAULT 'Pending',
-        timestamp TEXT
-    )""")
-    conn.commit()
-    conn.close()
+    def query(self, sql, params=(), commit=False):
+        with sqlite3.connect(self.db_name) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            if commit:
+                conn.commit()
+            return cur.fetchall()
 
-init_db()
+    def init_db(self):
+        self.query("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, 
+            username TEXT, 
+            balance REAL DEFAULT 0,
+            invites INTEGER DEFAULT 0,
+            referrer_id INTEGER,
+            joined_at TEXT
+        )""", commit=True)
+        self.query("""CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            status TEXT DEFAULT 'Pending'
+        )""", commit=True)
 
-# ================= SMART HELPERS =================
+db = Database()
 
-def get_smart_pass():
-    """আপনার সেই ৭ অক্ষরের নাম + আজকের তারিখ লজিক"""
-    names = ["Tanjimz", "Saidurz", "Rifatxx", "Mimproo", "Siyamzz", "Cyberxx"]
-    name = random.choice(names)
-    day = datetime.now().strftime("%d")
-    return f"{name}{day}"
+# ================= CORE UTILS =================
+class Utils:
+    @staticmethod
+    def generate_creds():
+        user = "tg_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        pwd = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+        email = f"tan_{random.randint(10000, 99999)}@tmailor.com"
+        return user, pwd, email
 
-def get_2fa_otp(secret):
-    """২এফএ সিক্রেট থেকে ৬ ডিজিটের কোড বের করার লজিক"""
-    try:
-        secret = secret.replace(" ", "").upper()
-        key = base64.b32decode(secret + '=' * ((8 - len(secret) % 8) % 8))
-        counter = struct.pack('>Q', int(time.time() // 30))
-        hmac_hash = hmac.new(key, counter, hashlib.sha1).digest()
-        offset = hmac_hash[-1] & 0x0F
-        code = (struct.unpack('>I', hmac_hash[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
-        return f"{code:06d}"
-    except Exception as e:
-        return f"Error: {str(e)}"
+    @staticmethod
+    def verify_2fa(secret):
+        try:
+            secret = secret.replace(" ", "").upper()
+            if not re.match(r'^[A-Z2-7=]+$', secret): return None
+            key = base64.b32decode(secret + '=' * ((8 - len(secret) % 8) % 8))
+            counter = struct.pack('>Q', int(time.time() // 30))
+            hmac_hash = hmac.new(key, counter, hashlib.sha1).digest()
+            offset = hmac_hash[-1] & 0x0F
+            code = (struct.unpack('>I', hmac_hash[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
+            return f"{code:06d}"
+        except: return None
 
-# ================= KEYBOARDS (Full Menu) =================
-
-def main_menu():
+# ================= MARKUPS =================
+def main_kb():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("📋 Tasks", "💰 Balance")
-    markup.add("📤 Withdraw", "👤 Profile")
-    markup.add("🏆 Top Users", "👥 Referrals")
-    markup.add("🌍 Language", "📞 Support")
+    markup.add("📋 Tasks", "💰 Balance", "📤 Withdraw", "👤 Profile", "👥 Referrals", "📞 Support")
     return markup
 
-def task_categories():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("📸 Instagram 2FA", "🍪 IG Cookies")
-    markup.add("📘 Facebook Task", "❌ Cancel")
+def cancel_kb():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("❌ Cancel")
     return markup
 
-# ================= CORE HANDLERS =================
+# ================= HANDLERS =================
 
 @bot.message_handler(commands=['start'])
-def welcome(message):
+def start(message):
     uid = message.from_user.id
     uname = message.from_user.first_name
     
-    # Referral Tracking logic
+    # Referral Tracking
     ref_id = None
-    if "ref_" in message.text:
+    if len(message.text.split()) > 1 and "ref_" in message.text:
         try:
-            ref_id = int(message.text.split()[1].split('_')[1])
+            ref_id = int(message.text.split()[1].replace("ref_", ""))
             if ref_id == uid: ref_id = None
         except: ref_id = None
 
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?,?,?)", (uid, uname, ref_id))
-    conn.commit()
-    conn.close()
+    # Register User
+    existing = db.query("SELECT * FROM users WHERE user_id=?", (uid,))
+    if not existing:
+        db.query("INSERT INTO users (user_id, username, referrer_id, joined_at) VALUES (?,?,?,?)", 
+                 (uid, uname, ref_id, datetime.now().isoformat()), commit=True)
+        if ref_id:
+            db.query("UPDATE users SET balance = balance + 2, invites = invites + 1 WHERE user_id=?", (ref_id,), commit=True)
+            bot.send_message(ref_id, f"🎉 আপনার লিংকে নতুন একজন যোগ দিয়েছে! আপনি ২৳ বোনাস পেয়েছেন।")
 
-    welcome_text = f"━━━━━━━━━━━━━━━━━━━━━━\n👋 Welcome to Task Bot, <b>{uname}</b>!\n━━━━━━━━━━━━━━━━━━━━━━"
-    bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu())
-
-@bot.message_handler(func=lambda m: m.text == "❌ Cancel")
-def back_home(message):
-    bot.send_message(message.chat.id, "🏠 ফিরে আসা হয়েছে মেইন মেনুতে।", reply_markup=main_menu())
-
-# --- 📋 TASK SYSTEM (STEP-BY-STEP) ---
-
-@bot.message_handler(func=lambda m: m.text == "📋 Tasks")
-def show_tasks(message):
-    bot.send_message(message.chat.id, "👇 Please select a task category:", reply_markup=task_categories())
-
-@bot.message_handler(func=lambda m: m.text == "📸 Instagram 2FA")
-def ig_task_init(message):
-    # ইনস্ট্রাকশন ফ্লো
-    instr = """
-⏳ Review time: 64 minutes
-📋 <b>Instagram Account Setup</b>
-📄 নতুন ইন্সটাগ্রাম অ্যাকাউন্ট তৈরি করুন।
-🔐 <b>Important:</b>
-• নিচে দেওয়া পাসওয়ার্ড ব্যবহার করুন।
-• ওটিপি এর জন্য নিচের বাটন চাপুন।
-"""
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("▶️ Start Task", callback_data="start_ig_2fa"))
-    bot.send_message(message.chat.id, instr, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "start_ig_2fa")
-def ig_start_logic(call):
-    uid = call.from_user.id
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    cur.execute("SELECT last_task_time FROM users WHERE user_id=?", (uid,))
-    last_time = cur.fetchone()[0]
-    conn.close()
-
-    # ৩ মিনিটের সিকিউরিটি লক
-    if time.time() - last_time < 180:
-        bot.answer_callback_query(call.id, "⚠️ Security block! ৩ মিনিট অপেক্ষা করুন।", show_alert=True)
-        return
-
-    psw = get_smart_pass()
-    # Tmailor.com লজিক (র্যান্ডম মেইল জেনারেশন সিমুলেশন)
-    temp_email = f"tan_{random.randint(1000,9999)}@tmailor.com"
-    
-    bot.send_message(call.message.chat.id, "⏳ Ordering email, please wait...")
-    time.sleep(1)
-    
-    task_msg = f"""
-1️⃣ <b>Like Task Selected</b>
-━━━━━━━━━━━━━━━━━━━━━━
-📧 Email: <code>{temp_email}</code>
-🔑 Password: <code>{psw}</code>
-━━━━━━━━━━━━━━━━━━━━━━
-👇 মেইলে কোড পাঠিয়ে নিচের বাটনে চাপ দিন।
-"""
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📥 Get Mail OTP", callback_data="fetch_mail_otp"))
-    bot.send_message(call.message.chat.id, task_msg, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "fetch_mail_otp")
-def fetch_otp(call):
-    # এখানে আপনার API এর মাধ্যমে ইনবক্স চেক করার লজিক বসবে
-    bot.send_message(call.message.chat.id, "2SMS 🔍 Searching for email, please wait...")
-    time.sleep(2)
-    sample_otp = random.randint(111111, 999999)
-    
-    resp = f"3SMS 📋 Code from email:\n\n<code>{sample_otp}</code>\n\n👆 Tap to copy.\n\n4SMS 🔑 এখন আপনার <b>2FA Secret Key</b> টি পাঠান:"
-    bot.send_message(call.message.chat.id, resp)
-    bot.register_next_step_handler(call.message, process_2fa_final)
-
-def process_2fa_final(message):
-    secret = message.text.strip()
-    two_fa_otp = get_2fa_otp(secret)
-    
-    # লাস্ট টাস্ক টাইম আপডেট
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET last_task_time = ? WHERE user_id = ?", (time.time(), message.from_user.id))
-    conn.commit()
-    conn.close()
-
-    final_text = f"1otp\n2SMS 📋 Your 2FA code:\n\n<code>{two_fa_otp}</code>\n\n👆 Tap to copy.\n\n3SmS 👉 কাজ শেষ হলে নিচের বাটনে রিপোর্ট দিন।"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Account Registered", callback_data="task_complete_final"))
-    bot.send_message(message.chat.id, final_text, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "task_complete_final")
-def task_done(call):
-    bot.edit_message_text("✅ Your report has been received! Please wait.", call.message.chat.id, call.message.message_id)
-
-# --- 🍪 COOKIES TASK ---
-
-@bot.message_handler(func=lambda m: m.text == "🍪 IG Cookies")
-def ig_cookies_task(message):
-    msg = bot.send_message(message.chat.id, "📄 আপনার ইন্সটাগ্রাম কুকি (JSON/Netscape) এখানে পেস্ট করুন:")
-    bot.register_next_step_handler(msg, save_cookie_report)
-
-def save_cookie_report(message):
-    cookie_data = message.text
-    # ডাটাবেজে সেভ
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    cur.execute("INSERT INTO reports (user_id, task_type, data, timestamp) VALUES (?,?,?,?)", 
-                (message.from_user.id, "Cookies", cookie_data, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, "✅ কুকি রিপোর্ট জমা হয়েছে। অ্যাডমিন চেক করে ব্যালেন্স দিয়ে দিবে।")
-
-# --- 👑 ADMIN SYSTEM (FULL POWER) ---
-
-@bot.message_handler(commands=['admin'])
-def admin_access(message):
-    if message.from_user.id == ADMIN_ID:
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        markup.add("✅ Approve Bulk", "📊 Full Stats")
-        markup.add("💰 Add Balance", "📜 Pending Reports")
-        markup.add("🏠 Back to Menu")
-        bot.send_message(message.chat.id, "👑 <b>অ্যাডমিন প্যানেলে স্বাগতম, তানজিম বস!</b>", reply_markup=markup)
-    else:
-        bot.send_message(message.chat.id, "❌ এক্সেস ডিনাইড!")
-
-@bot.message_handler(func=lambda m: m.text == "📊 Full Stats" and m.from_user.id == ADMIN_ID)
-def admin_stats(message):
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    total_u = cur.fetchone()[0]
-    cur.execute("SELECT SUM(balance) FROM users")
-    total_b = cur.fetchone()[0] or 0
-    conn.close()
-    
-    bot.send_message(message.chat.id, f"📊 <b>বট স্ট্যাটাস:</b>\n\n👥 মোট ইউজার: {total_u}\n💰 মোট পেআউট বাকি: {total_b}৳")
-
-@bot.message_handler(func=lambda m: m.text == "✅ Approve Bulk" and m.from_user.id == ADMIN_ID)
-def bulk_approve_ui(message):
-    msg = bot.send_message(message.chat.id, "📝 ইউজার আইডি বা ইউজারনেম লিস্ট দিন (এক লাইনে একটি):")
-    bot.register_next_step_handler(msg, bulk_approve_logic)
-
-def bulk_approve_logic(message):
-    entries = message.text.split('\n')
-    count = 0
-    for e in entries:
-        if e.strip():
-            # এখানে অটো ব্যালেন্স অ্যাড করার কোড থাকবে
-            count += 1
-    bot.send_message(message.chat.id, f"🏁 সফলভাবে {count} টি রিপোর্ট অ্যাপ্রুভ করা হয়েছে।")
-
-# ================= MISC BUTTONS =================
+    bot.send_message(uid, f"👋 স্বাগতম <b>{uname}</b>!\nআমাদের রিয়েল-টাইম আর্নিং সিস্টেমে আপনাকে স্বাগতম।", reply_markup=main_kb())
 
 @bot.message_handler(func=lambda m: m.text == "💰 Balance")
-def check_balance(message):
-    conn = sqlite3.connect("master_data.db")
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
-    res = cur.fetchone()
-    bal = res[0] if res else 0
-    conn.close()
-    bot.send_message(message.chat.id, f"💰 Your balance: <b>${bal:.4f}</b>\n💰 Wallet ━━━━━━━━━━━━━━━━━━━━━━")
+@bot.message_handler(func=lambda m: m.text == "👤 Profile")
+def profile(message):
+    user = db.query("SELECT * FROM users WHERE user_id=?", (message.from_user.id,))[0]
+    text = (f"👤 <b>ব্যবহারকারী:</b> {user['username']}\n"
+            f"🆔 <b>আইডি:</b> <code>{user['user_id']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 <b>বর্তমান ব্যালেন্স:</b> {user['balance']:.2f} ৳\n"
+            f"👥 <b>মোট রেফার:</b> {user['invites']} জন\n"
+            f"━━━━━━━━━━━━━━━━━━━━━")
+    bot.send_message(message.from_user.id, text)
 
-@bot.message_handler(func=lambda m: m.text == "📞 Support")
-def support_info(message):
-    bot.send_message(message.chat.id, f"━━━━━━━━━━━━━━━━━━━━━━\n🛠 Support: {SUPPORT_USER}\n━━━━━━━━━━━━━━━━━━━━━━")
+@bot.message_handler(func=lambda m: m.text == "👥 Referrals")
+def refer(message):
+    bot_user = bot.get_me().username
+    link = f"https://t.me/{bot_user}?start=ref_{message.from_user.id}"
+    bot.send_message(message.chat.id, f"🔗 <b>আপনার রেফারেল লিংক:</b>\n\n<code>{link}</code>\n\nপ্রতি রেফারে ২ টাকা বোনাস!")
 
-# ================= WEB SERVER & RUN =================
+@bot.message_handler(func=lambda m: m.text == "❌ Cancel")
+def cancel(message):
+    bot.send_message(message.chat.id, "🏠 মেইন মেনুতে ফিরে আসা হয়েছে।", reply_markup=main_kb())
 
+# --- TASK LOGIC ---
+@bot.message_handler(func=lambda m: m.text == "📋 Tasks")
+def show_tasks(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📸 Instagram 2FA Task", callback_data="task_ig"))
+    bot.send_message(message.chat.id, "👇 নিচের থেকে একটি কাজ বেছে নিন:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "task_ig")
+def task_ig_start(call):
+    u, p, e = Utils.generate_creds()
+    text = (f"🚀 <b>ইন্সটাগ্রাম টাস্ক ডিটেইলস:</b>\n\n"
+            f"📧 ইমেইল: <code>{e}</code>\n"
+            f"🔑 পাসওয়ার্ড: <code>{p}</code>\n\n"
+            f"⚠️ <b>নির্দেশনা:</b>\n১. ইমেইলটি ইন্সটাগ্রামে ব্যবহার করুন।\n"
+            f"২. ওটিপি পেতে নিচের বাটনে ক্লিক করুন।")
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📥 Get OTP", callback_data="get_otp_mail"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "get_otp_mail")
+def get_mail_otp(call):
+    bot.answer_callback_query(call.id, "🔍 Searching OTP from Tmailor...", show_alert=False)
+    time.sleep(2)
+    otp = random.randint(100000, 999999)
+    bot.send_message(call.message.chat.id, f"📩 আপনার ওটিপি কোড: <code>{otp}</code>\n\nএখন আপনার <b>2FA Secret Key</b> টি মেসেজ করুন:")
+    bot.register_next_step_handler(call.message, process_2fa)
+
+def process_2fa(message):
+    if message.text == "❌ Cancel": return
+    
+    code = Utils.verify_2fa(message.text)
+    if not code:
+        msg = bot.reply_to(message, "❌ <b>ভুল Secret Key!</b>\n\nদয়া করে সঠিক 2FA Web Key/Secret প্রদান করুন।")
+        bot.register_next_step_handler(msg, process_2fa)
+        return
+
+    bot.send_message(message.chat.id, f"✅ <b>2FA Verified!</b>\n\nআপনার ওটিপি: <code>{code}</code>\n\nটাস্কটি সাবমিট করতে নিচের বাটনে ক্লিক করুন।", 
+                     reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ Submit Done", callback_data="submit_done")))
+
+@bot.callback_query_handler(func=lambda call: call.data == "submit_done")
+def final_submit(call):
+    bot.edit_message_text("🏁 টাস্ক সাবমিট হয়েছে! অ্যাডমিন রিভিউ করার পর ব্যালেন্স যোগ হবে।", call.message.chat.id, call.message.message_id)
+
+# --- ADMIN PANEL ---
+@bot.message_handler(commands=['admin'])
+def admin(message):
+    if message.from_user.id != ADMIN_ID: return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("📊 Total Stats", "💰 Manual Add", "🏠 Main Menu")
+    bot.send_message(message.chat.id, "👑 <b>Admin Dashboard</b>", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Total Stats" and m.from_user.id == ADMIN_ID)
+def stats(message):
+    users = db.query("SELECT COUNT(*) as count FROM users")[0]['count']
+    payouts = db.query("SELECT SUM(amount) as s FROM withdrawals WHERE status='Pending'")[0]['s'] or 0
+    bot.send_message(message.chat.id, f"📈 <b>বট রিপোর্ট:</b>\n\n👥 মোট ইউজার: {users}\n⏳ পেন্ডিং উইথড্র: {payouts} ৳")
+
+# ================= SERVER RUN =================
 @app.route('/')
-def home(): return "Bot is Alive"
-def run_web(): app.run(host='0.0.0.0', port=8080)
+def home(): return "Bot is running professionally!"
+
+def run_server():
+    app.run(host='0.0.0.0', port=8080)
 
 if __name__ == "__main__":
-    t = Thread(target=run_web)
-    t.start()
-    logging.info("Bot is polling...")
-    bot.infinity_polling()
-  
+    logging.info("Bot started...")
+    Thread(target=run_server).start()
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    
